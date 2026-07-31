@@ -1,11 +1,12 @@
 """
 pipeline.py — Shared, reusable churn-prediction pipeline.
-Used by run_dataset1.py (Telco) and run_dataset2.py (Indian high-value churn),
-so both datasets go through an identical, documented methodology.
+Used by run_dataset1.py / run_dataset1_optuna.py (Telco) and
+run_dataset2.py / run_dataset2_optuna.py (Indian high-value churn),
+so all runs go through an identical, documented methodology.
 
-Includes both RandomizedSearchCV-based tuning (tune_random_forest, tune_xgboost,
-tune_lightgbm / run_full_pipeline) and Optuna TPE-based tuning
-(tune_*_optuna / run_full_pipeline_optuna) as a smarter alternative.
+Base learners: Random Forest, XGBoost (GPU), LightGBM, CatBoost (CPU).
+Supports both RandomizedSearchCV tuning (tune_*, run_full_pipeline) and
+Optuna TPE tuning (tune_*_optuna, run_full_pipeline_optuna).
 """
 
 import time
@@ -25,6 +26,7 @@ from imblearn.pipeline import Pipeline as ImbPipeline
 from imblearn.over_sampling import SMOTE
 from xgboost import XGBClassifier
 from lightgbm import LGBMClassifier
+from catboost import CatBoostClassifier
 
 import optuna
 optuna.logging.set_verbosity(optuna.logging.WARNING)
@@ -35,24 +37,22 @@ optuna.logging.set_verbosity(optuna.logging.WARNING)
 # =========================================================
 
 def split_and_scale(X, y, numeric_cols, test_size=0.2, random_state=42):
-    """Stratified split + scale numeric columns. Returns X_train, X_test, y_train, y_test, scaler."""
     scaler = StandardScaler()
     X = X.copy()
     X[numeric_cols] = scaler.fit_transform(X[numeric_cols])
     X = X.astype(float)
-
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=test_size, random_state=random_state, stratify=y
     )
     return X_train, X_test, y_train, y_test, scaler
 
 
-def train_stacked_ensemble(rf_final, xgb_final, lgbm_final, X_train, y_train, random_state=42):
-    """Balances training data, trains the stack, tunes the decision threshold on held-out test data."""
+def train_stacked_ensemble(rf_final, xgb_final, lgbm_final, cat_final, X_train, y_train, random_state=42):
+    """Balances training data, trains the 4-model stack, tunes the decision threshold."""
     X_train_bal, y_train_bal = SMOTE(random_state=random_state).fit_resample(X_train, y_train)
 
     stack_model = StackingClassifier(
-        estimators=[('rf', rf_final), ('xgb', xgb_final), ('lgbm', lgbm_final)],
+        estimators=[('rf', rf_final), ('xgb', xgb_final), ('lgbm', lgbm_final), ('cat', cat_final)],
         final_estimator=LogisticRegression(max_iter=1000),
         cv=5, n_jobs=-1
     )
@@ -79,7 +79,6 @@ def evaluate(y_true, preds):
 
 
 def overfitting_check(models_dict, X_train, y_train, X_test, y_test):
-    """models_dict: {'Model Name': fitted_model, ...}. Evaluates on ORIGINAL (unbalanced) train vs test."""
     results = []
     for name, m in models_dict.items():
         train_preds = m.predict(X_train)
@@ -97,7 +96,6 @@ def overfitting_check(models_dict, X_train, y_train, X_test, y_test):
 
 
 def efficiency_check(models_dict, X_train_bal, y_train_bal, X_test):
-    """models_dict: {'Model Name': unfitted_or_fitted_model, ...}"""
     results = []
     for name, m in models_dict.items():
         start = time.time()
@@ -118,7 +116,6 @@ def efficiency_check(models_dict, X_train_bal, y_train_bal, X_test):
 
 
 def save_model_files(result, prefix):
-    """Saves all deployable artifacts for a pipeline run, prefixed so dataset1/dataset2 files don't collide."""
     joblib.dump(result['stack_model'], f'{prefix}_churn_model.pkl')
     joblib.dump(result['scaler'], f'{prefix}_scaler.pkl')
     joblib.dump(result['feature_columns'], f'{prefix}_feature_columns.pkl')
@@ -128,7 +125,7 @@ def save_model_files(result, prefix):
 
 
 # =========================================================
-# RandomizedSearchCV-based tuning (original approach)
+# RandomizedSearchCV-based tuning
 # =========================================================
 
 def tune_random_forest(X_train, y_train, n_iter=30, cv=5, random_state=42, custom_params=None):
@@ -190,7 +187,25 @@ def tune_lightgbm(X_train, y_train, n_iter=30, cv=5, random_state=42, custom_par
     return search
 
 
-def build_final_models(rf_search, xgb_search, lgbm_search, random_state=42):
+def tune_catboost(X_train, y_train, n_iter=30, cv=5, random_state=42, custom_params=None):
+    pipeline = ImbPipeline([
+        ('smote', SMOTE(random_state=random_state)),
+        ('clf', CatBoostClassifier(random_state=random_state, verbose=0, allow_writing_files=False))
+    ])
+    params = custom_params if custom_params is not None else {
+        'clf__iterations': [100, 200, 300, 400],
+        'clf__depth': [3, 4, 5, 6, 8],
+        'clf__learning_rate': [0.01, 0.05, 0.1, 0.2],
+        'clf__l2_leaf_reg': [1, 3, 5, 7, 9],
+        'clf__subsample': [0.7, 0.8, 0.9, 1.0],
+    }
+    search = RandomizedSearchCV(pipeline, params, n_iter=n_iter, scoring='f1',
+                                 cv=cv, random_state=random_state, n_jobs=-1)
+    search.fit(X_train, y_train)
+    return search
+
+
+def build_final_models(rf_search, xgb_search, lgbm_search, cat_search, random_state=42):
     rf_final = RandomForestClassifier(
         n_estimators=rf_search.best_params_['clf__n_estimators'],
         min_samples_split=rf_search.best_params_['clf__min_samples_split'],
@@ -226,17 +241,22 @@ def build_final_models(rf_search, xgb_search, lgbm_search, random_state=42):
         reg_lambda=lgbm_search.best_params_['clf__reg_lambda'],
         random_state=random_state, verbose=-1
     )
-    return rf_final, xgb_final, lgbm_final
+
+    cat_final = CatBoostClassifier(
+        iterations=cat_search.best_params_['clf__iterations'],
+        depth=cat_search.best_params_['clf__depth'],
+        learning_rate=cat_search.best_params_['clf__learning_rate'],
+        l2_leaf_reg=cat_search.best_params_['clf__l2_leaf_reg'],
+        subsample=cat_search.best_params_['clf__subsample'],
+        random_state=random_state, verbose=0, allow_writing_files=False
+    )
+
+    return rf_final, xgb_final, lgbm_final, cat_final
 
 
 def run_full_pipeline(X, y, numeric_cols, dataset_name="Dataset", n_iter=30,
-                       rf_custom_params=None, xgb_custom_params=None, lgbm_custom_params=None):
-    """
-    Runs the ENTIRE pipeline end-to-end on a given (X, y) using RandomizedSearchCV tuning.
-    Pass rf_custom_params / xgb_custom_params / lgbm_custom_params to override the
-    default hyperparameter search grids (e.g., stricter regularization for
-    high-dimensional or heavily imbalanced datasets).
-    """
+                       rf_custom_params=None, xgb_custom_params=None,
+                       lgbm_custom_params=None, cat_custom_params=None):
     print(f"\n{'='*60}\nRUNNING FULL PIPELINE ON: {dataset_name}\n{'='*60}")
     print(f"Shape: {X.shape}, Churn rate: {y.mean():.4f}")
 
@@ -255,10 +275,16 @@ def run_full_pipeline(X, y, numeric_cols, dataset_name="Dataset", n_iter=30,
     lgbm_search = tune_lightgbm(X_train, y_train, n_iter=n_iter, custom_params=lgbm_custom_params)
     print("Best LightGBM CV F1:", lgbm_search.best_score_)
 
-    rf_final, xgb_final, lgbm_final = build_final_models(rf_search, xgb_search, lgbm_search)
+    print("\nTuning CatBoost...")
+    cat_search = tune_catboost(X_train, y_train, n_iter=n_iter, custom_params=cat_custom_params)
+    print("Best CatBoost CV F1:", cat_search.best_score_)
 
-    print("\nTraining stacked ensemble...")
-    stack_model, X_train_bal, y_train_bal = train_stacked_ensemble(rf_final, xgb_final, lgbm_final, X_train, y_train)
+    rf_final, xgb_final, lgbm_final, cat_final = build_final_models(rf_search, xgb_search, lgbm_search, cat_search)
+
+    print("\nTraining stacked ensemble (4 base learners)...")
+    stack_model, X_train_bal, y_train_bal = train_stacked_ensemble(
+        rf_final, xgb_final, lgbm_final, cat_final, X_train, y_train
+    )
 
     best_threshold, probs = tune_threshold(stack_model, X_test, y_test)
     preds_tuned = (probs >= best_threshold).astype(int)
@@ -269,9 +295,10 @@ def run_full_pipeline(X, y, numeric_cols, dataset_name="Dataset", n_iter=30,
     xgb_final.fit(X_train_bal, y_train_bal)
     rf_final.fit(X_train_bal, y_train_bal)
     lgbm_final.fit(X_train_bal, y_train_bal)
+    cat_final.fit(X_train_bal, y_train_bal)
 
     models_dict = {'Random Forest': rf_final, 'XGBoost': xgb_final,
-                    'LightGBM': lgbm_final, 'Stacked Ensemble': stack_model}
+                    'LightGBM': lgbm_final, 'CatBoost': cat_final, 'Stacked Ensemble': stack_model}
 
     print("\n=== Overfitting Check ===")
     overfit_df = overfitting_check(models_dict, X_train, y_train, X_test, y_test)
@@ -285,7 +312,7 @@ def run_full_pipeline(X, y, numeric_cols, dataset_name="Dataset", n_iter=30,
         'dataset_name': dataset_name,
         'scaler': scaler, 'X_train': X_train, 'X_test': X_test,
         'y_train': y_train, 'y_test': y_test,
-        'rf_final': rf_final, 'xgb_final': xgb_final, 'lgbm_final': lgbm_final,
+        'rf_final': rf_final, 'xgb_final': xgb_final, 'lgbm_final': lgbm_final, 'cat_final': cat_final,
         'stack_model': stack_model, 'best_threshold': best_threshold,
         'final_metrics': final_metrics, 'overfit_df': overfit_df, 'efficiency_df': eff_df,
         'feature_columns': X_train.columns.tolist()
@@ -293,7 +320,7 @@ def run_full_pipeline(X, y, numeric_cols, dataset_name="Dataset", n_iter=30,
 
 
 # =========================================================
-# Optuna (TPE) based tuning — smarter search than RandomizedSearchCV
+# Optuna (TPE) based tuning
 # =========================================================
 
 def tune_random_forest_optuna(X_train, y_train, n_trials=30, cv=5, random_state=42, search_bounds=None):
@@ -311,9 +338,7 @@ def tune_random_forest_optuna(X_train, y_train, n_trials=30, cv=5, random_state=
             ('clf', RandomForestClassifier(random_state=random_state, n_jobs=-1, **params))
         ])
         return cross_val_score(pipeline, X_train, y_train, cv=cv, scoring='f1', n_jobs=-1).mean()
-
-    study = optuna.create_study(direction='maximize',
-                                 sampler=optuna.samplers.TPESampler(seed=random_state))
+    study = optuna.create_study(direction='maximize', sampler=optuna.samplers.TPESampler(seed=random_state))
     study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
     return study
 
@@ -336,11 +361,8 @@ def tune_xgboost_optuna(X_train, y_train, n_trials=30, cv=5, random_state=42, se
             ('clf', XGBClassifier(random_state=random_state, eval_metric='logloss',
                                    tree_method='hist', device='cuda', **params))
         ])
-        # n_jobs=1 here — GPU training doesn't parallelize safely across CV folds the way CPU does
         return cross_val_score(pipeline, X_train, y_train, cv=cv, scoring='f1', n_jobs=1).mean()
-
-    study = optuna.create_study(direction='maximize',
-                                 sampler=optuna.samplers.TPESampler(seed=random_state))
+    study = optuna.create_study(direction='maximize', sampler=optuna.samplers.TPESampler(seed=random_state))
     study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
     return study
 
@@ -363,14 +385,43 @@ def tune_lightgbm_optuna(X_train, y_train, n_trials=30, cv=5, random_state=42, s
             ('clf', LGBMClassifier(random_state=random_state, verbose=-1, **params))
         ])
         return cross_val_score(pipeline, X_train, y_train, cv=cv, scoring='f1', n_jobs=-1).mean()
-
-    study = optuna.create_study(direction='maximize',
-                                 sampler=optuna.samplers.TPESampler(seed=random_state))
+    study = optuna.create_study(direction='maximize', sampler=optuna.samplers.TPESampler(seed=random_state))
     study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
     return study
 
 
-def build_final_models_from_optuna(rf_study, xgb_study, lgbm_study, random_state=42):
+def tune_catboost_optuna(X_train, y_train, n_trials=30, cv=5, random_state=42, search_bounds=None):
+    b = search_bounds or {}
+    def objective(trial):
+        params = {
+            'iterations': trial.suggest_int('iterations', *b.get('iterations', (100, 500))),
+            'depth': trial.suggest_int('depth', *b.get('depth', (3, 10))),
+            'learning_rate': trial.suggest_float('learning_rate', *b.get('learning_rate', (0.005, 0.3)), log=True),
+            'l2_leaf_reg': trial.suggest_float('l2_leaf_reg', *b.get('l2_leaf_reg', (1.0, 10.0))),
+            'subsample': trial.suggest_float('subsample', *b.get('subsample', (0.5, 1.0))),
+        }
+        pipeline = ImbPipeline([
+            ('smote', SMOTE(random_state=random_state)),
+            ('clf', CatBoostClassifier(random_state=random_state, verbose=0, allow_writing_files=False, **params))
+        ])
+        return cross_val_score(pipeline, X_train, y_train, cv=cv, scoring='f1', n_jobs=-1).mean()
+    study = optuna.create_study(direction='maximize', sampler=optuna.samplers.TPESampler(seed=random_state))
+    study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
+    return study
+
+
+def build_final_models_from_optuna(rf_study, xgb_study, lgbm_study, cat_study, random_state=42):
+    rf_final = RandomForestClassifier(**rf_study.best_params, random_state=random_state, n_jobs=-1)
+    xgb_final = XGBClassifier(**xgb_study.best_params, random_state=random_state,
+                               eval_metric='logloss', tree_method='hist', device='cuda')
+    lgbm_final = LGBMClassifier(**lgbm_study.best_params, random_state=random_state, verbose=-1)
+    cat_final = CatBoostClassifier(**cat_study.best_params, random_state=random_state, verbose=0, allow_writing_files=False)
+    return rf_final, xgb_final, lgbm_final, cat_final
+
+
+def build_final_models_from_optuna_3(rf_study, xgb_study, lgbm_study, random_state=42):
+    """3-model variant (no CatBoost) — used to regenerate the primary result,
+    which has better recall than the 4-model CatBoost version."""
     rf_final = RandomForestClassifier(**rf_study.best_params, random_state=random_state, n_jobs=-1)
     xgb_final = XGBClassifier(**xgb_study.best_params, random_state=random_state,
                                eval_metric='logloss', tree_method='hist', device='cuda')
@@ -379,13 +430,7 @@ def build_final_models_from_optuna(rf_study, xgb_study, lgbm_study, random_state
 
 
 def run_full_pipeline_optuna(X, y, numeric_cols, dataset_name="Dataset", n_trials=30,
-                              rf_bounds=None, xgb_bounds=None, lgbm_bounds=None):
-    """
-    Same end-to-end pipeline as run_full_pipeline, but using Optuna (TPE search)
-    instead of RandomizedSearchCV for all three base learners.
-    Pass rf_bounds / xgb_bounds / lgbm_bounds (dicts of param_name -> (low, high))
-    to tighten the search space for high-dimensional or heavily imbalanced datasets.
-    """
+                              rf_bounds=None, xgb_bounds=None, lgbm_bounds=None, cat_bounds=None):
     print(f"\n{'='*60}\nRUNNING FULL PIPELINE (OPTUNA) ON: {dataset_name}\n{'='*60}")
     print(f"Shape: {X.shape}, Churn rate: {y.mean():.4f}")
 
@@ -404,10 +449,18 @@ def run_full_pipeline_optuna(X, y, numeric_cols, dataset_name="Dataset", n_trial
     lgbm_study = tune_lightgbm_optuna(X_train, y_train, n_trials=n_trials, search_bounds=lgbm_bounds)
     print("Best LightGBM CV F1:", lgbm_study.best_value, "| params:", lgbm_study.best_params)
 
-    rf_final, xgb_final, lgbm_final = build_final_models_from_optuna(rf_study, xgb_study, lgbm_study)
+    print("\nTuning CatBoost (Optuna)...")
+    cat_study = tune_catboost_optuna(X_train, y_train, n_trials=n_trials, search_bounds=cat_bounds)
+    print("Best CatBoost CV F1:", cat_study.best_value, "| params:", cat_study.best_params)
 
-    print("\nTraining stacked ensemble...")
-    stack_model, X_train_bal, y_train_bal = train_stacked_ensemble(rf_final, xgb_final, lgbm_final, X_train, y_train)
+    rf_final, xgb_final, lgbm_final, cat_final = build_final_models_from_optuna(
+        rf_study, xgb_study, lgbm_study, cat_study
+    )
+
+    print("\nTraining stacked ensemble (4 base learners)...")
+    stack_model, X_train_bal, y_train_bal = train_stacked_ensemble(
+        rf_final, xgb_final, lgbm_final, cat_final, X_train, y_train
+    )
 
     best_threshold, probs = tune_threshold(stack_model, X_test, y_test)
     preds_tuned = (probs >= best_threshold).astype(int)
@@ -418,9 +471,10 @@ def run_full_pipeline_optuna(X, y, numeric_cols, dataset_name="Dataset", n_trial
     xgb_final.fit(X_train_bal, y_train_bal)
     rf_final.fit(X_train_bal, y_train_bal)
     lgbm_final.fit(X_train_bal, y_train_bal)
+    cat_final.fit(X_train_bal, y_train_bal)
 
     models_dict = {'Random Forest': rf_final, 'XGBoost': xgb_final,
-                    'LightGBM': lgbm_final, 'Stacked Ensemble': stack_model}
+                    'LightGBM': lgbm_final, 'CatBoost': cat_final, 'Stacked Ensemble': stack_model}
 
     print("\n=== Overfitting Check ===")
     overfit_df = overfitting_check(models_dict, X_train, y_train, X_test, y_test)
@@ -434,7 +488,7 @@ def run_full_pipeline_optuna(X, y, numeric_cols, dataset_name="Dataset", n_trial
         'dataset_name': dataset_name,
         'scaler': scaler, 'X_train': X_train, 'X_test': X_test,
         'y_train': y_train, 'y_test': y_test,
-        'rf_final': rf_final, 'xgb_final': xgb_final, 'lgbm_final': lgbm_final,
+        'rf_final': rf_final, 'xgb_final': xgb_final, 'lgbm_final': lgbm_final, 'cat_final': cat_final,
         'stack_model': stack_model, 'best_threshold': best_threshold,
         'final_metrics': final_metrics, 'overfit_df': overfit_df, 'efficiency_df': eff_df,
         'feature_columns': X_train.columns.tolist()
