@@ -3,22 +3,43 @@ import pandas as pd
 import joblib
 import shap
 from xgboost import XGBClassifier
+from database import ChurnDatabase
+from shap_explainer import SHAPToTextExplainer
+import uuid
 
 st.set_page_config(page_title="Customer Churn Predictor", layout="wide")
 
-# --- Load models and preprocessing objects (Dataset 1 / Telco, feature-engineered, primary) ---
-model = joblib.load('ds1fe_churn_model.pkl')
-scaler = joblib.load('ds1fe_scaler.pkl')
-feature_columns = joblib.load('ds1fe_feature_columns.pkl')
-best_threshold = joblib.load('ds1fe_best_threshold.pkl')
+# Initialize database
+db = ChurnDatabase()
 
-if hasattr(model, 'estimators_'):
-    for est in model.estimators_:
-        if isinstance(est, XGBClassifier):
-            est.set_params(device='cpu')
+# Initialize SHAP text explainer
+shap_text_explainer = SHAPToTextExplainer()
+
+# --- Load models and preprocessing objects (Dataset 1 / Telco, Calibrated - best recall: 0.810) ---
+model = joblib.load('models/ds1calcv_churn_model.pkl')
+scaler = joblib.load('models/ds1calcv_scaler.pkl')
+feature_columns = joblib.load('models/ds1calcv_feature_columns.pkl')
+best_threshold = joblib.load('models/ds1calcv_best_threshold.pkl')
+
+# Force GPU-trained models to CPU for inference stability
+def force_cpu_on_xgb(model):
+    """Recursively force XGBClassifier to CPU, handling nested structures."""
+    if hasattr(model, 'estimators_'):
+        for est in model.estimators_:
+            force_cpu_on_xgb(est)
+    if hasattr(model, 'named_steps'):
+        for step_name, step in model.named_steps.items():
+            force_cpu_on_xgb(step)
+    if hasattr(model, 'calibrated_classifiers_'):
+        for cal in model.calibrated_classifiers_:
+            force_cpu_on_xgb(cal.estimator)
+    if isinstance(model, XGBClassifier):
+        model.set_params(device='cpu')
+
+force_cpu_on_xgb(model)
 
 shap_model = XGBClassifier()
-shap_model.load_model('ds1fe_shap_model.json')
+shap_model.load_model('models/ds1fe_shap_model.json')
 shap_model.set_params(device='cpu')
 explainer = shap.TreeExplainer(shap_model)
 
@@ -48,47 +69,8 @@ def top_factors_to_action(top_factors):
 
 
 def compute_tenure_group(tenure):
-    """Matches the pd.cut bins/labels used during training:
-    bins=[-1,6,12,24,48,72], labels=['0-6mo','7-12mo','13-24mo','25-48mo','49-72mo']"""
-    if tenure <= 6:
-        return '0-6mo'
-    elif tenure <= 12:
-        return '7-12mo'
-    elif tenure <= 24:
-        return '13-24mo'
-    elif tenure <= 48:
-        return '25-48mo'
-    else:
-        return '49-72mo'
-
-
-def add_engineered_features(raw, tenure, monthly_charges, total_charges, contract, payment_method,
-                             online_security, online_backup, device_protection,
-                             tech_support, streaming_tv, streaming_movies):
-    """Computes the 6 engineered features and adds them (as raw dict entries, including
-    the correct one-hot TenureGroup dummy) — used by single-customer, batch, and what-if paths."""
-    avg_monthly_spend = total_charges / (tenure + 1)
-    charge_increase = monthly_charges - avg_monthly_spend
-    num_services = sum([
-        online_security == "Yes", online_backup == "Yes", device_protection == "Yes",
-        tech_support == "Yes", streaming_tv == "Yes", streaming_movies == "Yes"
-    ])
-    high_risk_combo = 1 if (contract == "Month-to-month" and payment_method == "Electronic check") else 0
-    is_new_customer = 1 if tenure <= 3 else 0
-    tenure_group = compute_tenure_group(tenure)
-
-    raw['AvgMonthlySpend'] = avg_monthly_spend
-    raw['ChargeIncrease'] = charge_increase
-    raw['NumServices'] = num_services
-    raw['HighRiskCombo'] = high_risk_combo
-    raw['IsNewCustomer'] = is_new_customer
-
-    # TenureGroup one-hot — '0-6mo' was the dropped baseline category during training
-    tg_col = f'TenureGroup_{tenure_group}'
-    if tg_col in feature_columns:
-        raw[tg_col] = 1
-
-    return raw
+    """Not used for Optuna model (no feature engineering)"""
+    return None
 
 
 # =========================================================
@@ -148,6 +130,22 @@ def build_feature_vector(inputs):
         'MonthlyCharges': inputs['monthly_charges'],
         'TotalCharges': inputs['total_charges'],
     }
+    
+    # Add engineered features
+    raw['AvgMonthlySpend'] = inputs['total_charges'] / max(inputs['tenure'], 1)
+    raw['ChargeIncrease'] = 1 if inputs['monthly_charges'] > (inputs['total_charges'] / max(inputs['tenure'], 1)) else 0
+    raw['NumServices'] = sum([
+        1 if inputs['phone_service'] == "Yes" else 0,
+        1 if inputs['online_security'] == "Yes" else 0,
+        1 if inputs['online_backup'] == "Yes" else 0,
+        1 if inputs['device_protection'] == "Yes" else 0,
+        1 if inputs['tech_support'] == "Yes" else 0,
+        1 if inputs['streaming_tv'] == "Yes" else 0,
+        1 if inputs['streaming_movies'] == "Yes" else 0,
+    ])
+    raw['IsNewCustomer'] = 1 if inputs['tenure'] < 6 else 0
+    raw['HighRiskCombo'] = 1 if (inputs['contract'] == "Month-to-month" and inputs['payment_method'] == "Electronic check") else 0
+    
     for col in feature_columns:
         if col not in raw:
             raw[col] = 0
@@ -204,14 +202,6 @@ def build_feature_vector(inputs):
     elif inputs['payment_method'] == "Credit card (automatic)":
         raw['PaymentMethod_Credit card (automatic)'] = 1
 
-    # --- Engineered features (must match training exactly) ---
-    raw = add_engineered_features(
-        raw, inputs['tenure'], inputs['monthly_charges'], inputs['total_charges'],
-        inputs['contract'], inputs['payment_method'],
-        inputs['online_security'], inputs['online_backup'], inputs['device_protection'],
-        inputs['tech_support'], inputs['streaming_tv'], inputs['streaming_movies']
-    )
-
     input_df = pd.DataFrame([raw])[feature_columns].astype(float)
     scale_cols = ['tenure', 'MonthlyCharges', 'TotalCharges', 'AvgMonthlySpend', 'ChargeIncrease', 'NumServices']
     input_df[scale_cols] = scaler.transform(input_df[scale_cols])
@@ -224,7 +214,7 @@ def predict_probability(inputs):
 
 
 def preprocess_raw_dataframe(raw_df):
-    """Batch version — same engineered features computed row-wise."""
+    """Batch version with feature engineering for calibrated model."""
     df = raw_df.copy()
     customer_ids = df['customerID'].astype(str) if 'customerID' in df.columns else pd.Series(
         [f"row_{i}" for i in range(len(df))]
@@ -235,16 +225,6 @@ def preprocess_raw_dataframe(raw_df):
         df = df.drop(columns=['Churn'])
     if 'TotalCharges' in df.columns:
         df['TotalCharges'] = pd.to_numeric(df['TotalCharges'], errors='coerce').fillna(0)
-
-    # Engineered features, computed row-wise
-    df['AvgMonthlySpend'] = df['TotalCharges'] / (df['tenure'] + 1)
-    df['ChargeIncrease'] = df['MonthlyCharges'] - df['AvgMonthlySpend']
-    service_cols = ['OnlineSecurity', 'OnlineBackup', 'DeviceProtection',
-                     'TechSupport', 'StreamingTV', 'StreamingMovies']
-    df['NumServices'] = df[service_cols].apply(lambda row: (row == 'Yes').sum(), axis=1)
-    df['TenureGroup'] = df['tenure'].apply(compute_tenure_group)
-    df['HighRiskCombo'] = ((df['Contract'] == 'Month-to-month') & (df['PaymentMethod'] == 'Electronic check')).astype(int)
-    df['IsNewCustomer'] = (df['tenure'] <= 3).astype(int)
 
     binary_cols = ['Partner', 'Dependents', 'PhoneService', 'PaperlessBilling']
     for col in binary_cols:
@@ -257,9 +237,28 @@ def preprocess_raw_dataframe(raw_df):
 
     multi_cols = ['MultipleLines', 'InternetService', 'OnlineSecurity', 'OnlineBackup',
                   'DeviceProtection', 'TechSupport', 'StreamingTV', 'StreamingMovies',
-                  'Contract', 'PaymentMethod', 'TenureGroup']
+                  'Contract', 'PaymentMethod']
     present_multi = [c for c in multi_cols if c in df.columns]
     df_encoded = pd.get_dummies(df, columns=present_multi, drop_first=True)
+
+    # Add engineered features
+    df_encoded['AvgMonthlySpend'] = df_encoded['TotalCharges'] / df_encoded['tenure'].replace(0, 1)
+    df_encoded['ChargeIncrease'] = (df_encoded['MonthlyCharges'] > df_encoded['AvgMonthlySpend']).astype(int)
+    
+    # NumServices: count of service subscriptions
+    service_cols = ['PhoneService', 'OnlineSecurity_Yes', 'OnlineBackup_Yes', 
+                    'DeviceProtection_Yes', 'TechSupport_Yes', 'StreamingTV_Yes', 'StreamingMovies_Yes']
+    df_encoded['NumServices'] = 0
+    for col in service_cols:
+        if col in df_encoded.columns:
+            df_encoded['NumServices'] += df_encoded[col]
+    
+    df_encoded['IsNewCustomer'] = (df_encoded['tenure'] < 6).astype(int)
+    
+    # HighRiskCombo: month-to-month + electronic check
+    has_month_to_month = df_encoded['Contract_One year'] == 0
+    has_electronic_check = df_encoded['PaymentMethod_Electronic check'] == 1 if 'PaymentMethod_Electronic check' in df_encoded.columns else False
+    df_encoded['HighRiskCombo'] = (has_month_to_month & has_electronic_check).astype(int)
 
     for col in feature_columns:
         if col not in df_encoded.columns:
@@ -274,7 +273,7 @@ def risk_label(prob):
     return "🔴 High" if prob > 0.6 else ("🟡 Medium" if prob > best_threshold else "🟢 Low")
 
 
-tab1, tab2, tab3 = st.tabs(["👤 Single Customer", "📋 Batch Upload", "🔄 What-If Simulator"])
+tab1, tab2, tab3, tab4 = st.tabs(["👤 Single Customer", "📋 Batch Upload", "🔄 What-If Simulator", "📊 Dashboard"])
 
 # =========================================================
 # TAB 1: Single customer form
@@ -301,8 +300,31 @@ with tab1:
             top_factors = shap_series.sort_values(ascending=False).head(5)
             st.write("**Top factors influencing this prediction:**")
             st.bar_chart(top_factors)
+            
+            # Natural language explanation
+            st.divider()
+            st.write("**📝 Plain English Explanation:**")
+            input_df = build_feature_vector(inputs)
+            feature_values = input_df.iloc[0].values
+            nl_explanation = shap_text_explainer.generate_explanation(
+                shap_vals, feature_columns, feature_values, top_n=3
+            )
+            st.write(nl_explanation)
 
-        st.info("💡 Recommended Action: " + top_factors_to_action(top_factors.index.tolist()))
+        action = top_factors_to_action(top_factors.index.tolist())
+        st.info("💡 Recommended Action: " + action)
+
+        # Save to database
+        customer_id = f"manual_{uuid.uuid4().hex[:8]}"
+        db.add_single_prediction(
+            customer_id=customer_id,
+            churn_probability=prob,
+            risk_level=risk_label(prob),
+            top_factors=top_factors.index.tolist(),
+            recommended_action=action,
+            input_features=inputs
+        )
+        st.success("✅ Prediction saved to database")
 
 # =========================================================
 # TAB 2: Batch CSV upload
@@ -363,6 +385,20 @@ with tab2:
                 "⬇️ Download Full Risk Report (CSV)", data=csv_bytes,
                 file_name="churn_risk_report.csv", mime="text/csv", type="primary"
             )
+
+            # Save to database
+            batch_id = f"batch_{uuid.uuid4().hex[:8]}"
+            db_predictions = []
+            for _, row in results_df.iterrows():
+                db_predictions.append({
+                    'customer_id': row['Customer ID'],
+                    'churn_probability': row['Churn Probability'],
+                    'risk_level': row['Risk Level'],
+                    'top_factors': row['Top Risk Factors'].split(', '),
+                    'recommended_action': row['Recommended Action']
+                })
+            db.add_batch_predictions(batch_id, db_predictions)
+            st.success(f"✅ Batch saved to database (ID: {batch_id})")
         except Exception as e:
             st.error(f"Couldn't process this file: {e}")
             st.write("Make sure your CSV has the expected columns listed above.")
@@ -438,3 +474,111 @@ with tab3:
             )
         else:
             st.info(f"Changing {factor.lower()} alone doesn't meaningfully change this customer's risk — other factors dominate.")
+
+# =========================================================
+# TAB 4: Dashboard
+# =========================================================
+with tab4:
+    st.write("📊 Prediction History & Risk Queue Dashboard")
+    
+    # Dashboard stats
+    stats = db.get_dashboard_stats()
+    
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Total Single Predictions", stats['total_single_predictions'])
+    col2.metric("Total Batch Predictions", stats['total_batch_predictions'])
+    col3.metric("Pending High-Risk", stats['pending_risks'])
+    col4.metric("Recent High-Risk (7d)", stats['recent_high_risk_7days'])
+    
+    st.divider()
+    
+    # Risk Queue Section
+    st.subheader("🔴 High-Risk Queue (Pending Follow-up)")
+    
+    risk_queue = db.get_risk_queue(status='pending', limit=50)
+    
+    if len(risk_queue) > 0:
+        st.dataframe(
+            risk_queue[['customer_id', 'churn_probability', 'top_factors', 'recommended_action', 'timestamp']],
+            use_container_width=True
+        )
+        
+        # Risk queue actions
+        st.subheader("Risk Queue Actions")
+        colA, colB = st.columns(2)
+        
+        with colA:
+            customer_to_update = st.selectbox(
+                "Select customer to update status",
+                options=risk_queue['customer_id'].tolist()
+            )
+        
+        with colB:
+            new_status = st.selectbox(
+                "New status",
+                options=['contacted', 'resolved']
+            )
+        
+        follow_up_notes = st.text_area("Follow-up notes (optional)")
+        
+        if st.button("Update Status", type="primary"):
+            db.update_risk_queue_status(
+                customer_id=customer_to_update,
+                status=new_status,
+                follow_up_notes=follow_up_notes if follow_up_notes else None
+            )
+            st.success(f"✅ Updated {customer_to_update} to {new_status}")
+            st.rerun()
+    else:
+        st.info("No pending high-risk customers in queue.")
+    
+    st.divider()
+    
+    # Recent Predictions
+    st.subheader("📋 Recent Single Predictions")
+    
+    recent_single = db.get_single_predictions(limit=20)
+    if len(recent_single) > 0:
+        st.dataframe(
+            recent_single[['customer_id', 'churn_probability', 'risk_level', 'top_factors', 'timestamp']],
+            use_container_width=True
+        )
+    else:
+        st.info("No single predictions yet.")
+    
+    st.divider()
+    
+    # Batch History
+    st.subheader("📦 Batch Upload History")
+    
+    batch_metadata = db.get_batch_metadata(limit=20)
+    if len(batch_metadata) > 0:
+        st.dataframe(
+            batch_metadata,
+            use_container_width=True
+        )
+        
+        # View specific batch
+        if len(batch_metadata) > 0:
+            selected_batch = st.selectbox(
+                "View details for batch:",
+                options=batch_metadata['batch_id'].tolist()
+            )
+            
+            batch_details = db.get_batch_predictions(batch_id=selected_batch)
+            st.dataframe(
+                batch_details,
+                use_container_width=True
+            )
+    else:
+        st.info("No batch uploads yet.")
+    
+    st.divider()
+    
+    # Data management
+    st.subheader("🗄️ Data Management")
+    
+    if st.button("Clear data older than 30 days"):
+        db.clear_old_data(days=30)
+        st.success("✅ Old data cleared")
+        st.rerun()
